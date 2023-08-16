@@ -53,7 +53,6 @@ def do_train(
         if fast_video is not None:
             fast_video = fast_video.to(device)
         whwh = whwh.to(device)
-
         mem_extras = {}
         if mem_active:
             movie_ids = [m[0] for m in metadata]

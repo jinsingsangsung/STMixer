@@ -1,5 +1,5 @@
 DATA:
-  PATH_TO_DATA_DIR: "/path/to/ava"
+  PATH_TO_DATA_DIR: "/mnt/tmp/"
   NUM_FRAMES: 16
   SAMPLING_RATE: 4
   INPUT_CHANNEL_NUM: [3]
@@ -7,9 +7,9 @@ DATA:
   TRAIN_MIN_SCALES: [256, 320]
   TEST_MIN_SCALES: [256]
 AVA:
-  ANNOTATION_DIR: "annotations_v2.2/"
+  ANNOTATION_DIR: "./annotations/"
 MODEL:
-  WEIGHT: "/path/to/weight.pth"
+  WEIGHT: "../pretrained_models/backbone/VMAE_ViTB_16x4.pth"
   BACKBONE:
     CONV_BODY: "MAE-ViT-B"
     PATHWAYS: 1
@@ -57,8 +57,8 @@ SOLVER:
   CHECKPOINT_PERIOD: 1
   EVAL_PERIOD: 1
   EVAL_AFTER: 3
-  VIDEOS_PER_BATCH: 8
+  VIDEOS_PER_BATCH: 2
   OPTIMIZING_METHOD: 'adamw'
 TEST:
-  VIDEOS_PER_BATCH: 16
+  VIDEOS_PER_BATCH: 2
 OUTPUT_DIR: "data/output/vitb-train"

@@ -215,7 +215,6 @@ class SlowPath(nn.Module):
         if not conv4_nonlocal:
             conv4_nl_mod = 1000
         self.c2_mapping = None
-
         self.conv1 = nn.Conv3d(3, conv_dims[0], (1 + use_temp_convs_set[0][0] * 2, 7, 7),
                                stride=(temp_strides_set[0][0], 2, 2),
                                padding=(use_temp_convs_set[0][0], 3, 3), bias=False)

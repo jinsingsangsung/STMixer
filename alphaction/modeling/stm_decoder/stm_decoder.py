@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from .util.box_ops import bbox_overlaps, box_cxcywh_to_xyxy, clip_boxes_tensor
 from .util.msaq import SAMPLE4D
 from .util.adaptive_mixing_operator import AdaptiveMixing
-from .util.head_utils import _get_activation_layer, bias_init_with_prob, decode_box, position_embedding, make_sample_points
+from .util.head_utils import _get_activation_layer, bias_init_with_prob, decode_box, position_embedding, make_sample_points, make_interpolated_features
 from .util.head_utils import FFN, MultiheadAttention
 from .util.loss import SetCriterion, HungarianMatcher
 
@@ -18,7 +18,7 @@ class AdaptiveSTSamplingMixing(nn.Module):
                  query_dim=256,
                  feat_channels=None):
         super(AdaptiveSTSamplingMixing, self).__init__()
-        self.spatial_points =  spatial_points
+        self.spatial_points = spatial_points
         self.temporal_points = temporal_points
         self.out_multiplier = out_multiplier
         self.n_groups = n_groups
@@ -76,8 +76,9 @@ class AdaptiveSTSamplingMixing(nn.Module):
 
         offset = self.offset_generator(spatial_queries)
         sample_points_xy = make_sample_points(offset, self.n_groups * self.spatial_points, proposal_boxes)
+        interpolated_features = make_interpolated_features(features)
+        
         sampled_feature, _ = SAMPLE4D(sample_points_xy, features, featmap_strides=featmap_strides, n_points=self.spatial_points)
-
         # B, C, n_groups, temporal_points, spatial_points, n_query, _ = sampled_feature.size()
         sampled_feature = sampled_feature.flatten(5, 6)                   # B, n_channels, n_groups, temporal_points, spatial_points, n_query
         sampled_feature = sampled_feature.permute(0, 5, 2, 3, 4, 1)       # B, n_query, n_groups, temporal_points, spatial_points, n_channels
@@ -346,7 +347,6 @@ class STMDecoder(nn.Module):
         batch_size = len(whwh)
         whwh = whwh[:, None, :] # B, 1, 4
         proposals = proposals[None] * whwh # B, N, 4
-
         xy = 0.5 * (proposals[..., 0:2] + proposals[..., 2:4])
         wh = proposals[..., 2:4] - proposals[..., 0:2]
         z = (wh).prod(-1, keepdim=True).sqrt().log2()

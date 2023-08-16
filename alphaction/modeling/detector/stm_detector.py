@@ -1,10 +1,10 @@
 from torch import nn
 
 from ..backbone import build_backbone
-from ..stm_decoder.stm_decoder import build_stm_decoder
+from ..stm_decoder.dab_decoder import build_stm_decoder
 import fvcore.nn.weight_init as weight_init
 import torch
-
+from alphaction.modeling.stm_decoder.util.misc import NestedTensor
 
 class LayerNorm(nn.Module):
     """
@@ -101,7 +101,13 @@ class STMDetector(nn.Module):
     def space_forward(self, features):
         mapped_features = []
         for i, feature in enumerate(features):
-            mapped_features.append(self.lateral_convs[i](feature))
+            if isinstance(feature, NestedTensor):
+                mask = feature.mask
+                feature = feature.tensors
+                mapped_features.append(NestedTensor(self.lateral_convs[i](feature), mask))
+            else:
+                mapped_features.append(self.lateral_convs[i](feature))
+            
         return mapped_features
 
 
@@ -113,12 +119,12 @@ class STMDetector(nn.Module):
         # implemented in roi_heads
 
         if self.backbone.num_pathways == 1:
-            features = self.backbone([slow_video])
+            features, pos = self.backbone([slow_video])
         else:
-            features = self.backbone([slow_video, fast_video])
+            features, pos = self.backbone([slow_video, fast_video])
         mapped_features = self.space_forward(features)
 
-        return self.stm_head(mapped_features, whwh, boxes, labels)
+        return self.stm_head(mapped_features, pos, whwh, boxes, labels)
 
 
 def build_detection_model(cfg):

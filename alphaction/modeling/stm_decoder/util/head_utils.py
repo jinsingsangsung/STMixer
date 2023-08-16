@@ -2,8 +2,10 @@ import copy
 import torch
 import numpy as np
 import torch.nn as nn
+import torch.nn.functional as F
 import warnings
-
+from alphaction.modeling.stm_decoder.util.misc import NestedTensor
+from einops import rearrange
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -74,7 +76,7 @@ def make_sample_points(offset, num_group, xyzr):
     offset = offset.view(B, L, 1, num_group, 3)
 
     roi_cc = xyzr[..., :2]
-    scale = 2.00 ** xyzr[..., 2:3]
+    scale = 2.00 ** xyzr[..., 2:3] #image size
     ratio = 2.00 ** torch.cat([xyzr[..., 3:4] * -0.5,
                                xyzr[..., 3:4] * 0.5], dim=-1)
     roi_wh = scale * ratio
@@ -82,7 +84,6 @@ def make_sample_points(offset, num_group, xyzr):
     roi_lvl = xyzr[..., 2:3].view(B, L, 1)
 
     roi_lvl = roi_lvl.view(B, L, 1, 1, 1)
-
     offset_yx = offset[..., :2] * \
         roi_wh.view(B, L, 1, 1, 2)
     sample_yx = roi_cc.contiguous().view(B, L, 1, 1, 2) \
@@ -91,6 +92,61 @@ def make_sample_points(offset, num_group, xyzr):
     sample_lvl = roi_lvl + offset[..., 2:3]
 
     return torch.cat([sample_yx, sample_lvl], dim=-1)
+
+def make_interpolated_features(features, pos=None, num_frames=32, level=0):
+    '''
+        features: list of tensors [B, C, T, H_l, W_l]
+                l = 0, 1, ..., num_feats-1
+        return: list of tensors [B, C, T, H_0, W_0]
+    '''
+    interpolated_features = []
+    n_levels = len(features)
+    assert level < n_levels, f"target feature level {level} should be less than the number of feature level {len(features)}"
+    use_mask = isinstance(features[0], NestedTensor)
+    if use_mask:
+        tensors = [feature.tensors for feature in features]
+        mask = features[level].mask
+        mask = mask.repeat(1, num_frames//mask.size(1), 1, 1)
+        features = tensors
+
+    B, C, T, H, W = features[level].shape
+    if T == num_frames:
+        dh = torch.linspace(-1, 1, H, device=features[0].device)
+        dw = torch.linspace(-1, 1, W, device=features[0].device)
+        meshy, meshx = torch.meshgrid((dh, dw))
+        grid = torch.stack((meshy, meshx), 2)
+        grid = grid[None].expand(B*T, *grid.size())
+        for l, feature in enumerate(features):
+            feature = rearrange(feature, 'b c t h w -> (b t) c h w')
+            interpolated_features.append(
+                F.grid_sample(
+                    feature, grid,
+                    mode='bilinear', padding_mode='zeros', align_corners=False,            
+                ).view(B,T,C,H,W).transpose(1,2).contiguous()
+            )
+    else:
+        dh = torch.linspace(-1, 1, H, device=features[0].device)
+        dw = torch.linspace(-1, 1, W, device=features[0].device)
+        dt = torch.linspace(-1, 1, num_frames, device=features[0].device)
+        mesht, meshy, meshx= torch.meshgrid((dt, dh, dw))
+        grid = torch.stack((mesht, meshy, meshx), -1)
+        grid = grid[None].expand(B, *grid.size())
+        for l, feature in enumerate(features):
+            interpolated_features.append(
+                F.grid_sample(
+                    feature, grid,
+                    mode='bilinear', padding_mode='zeros', align_corners=False,
+                )
+            )
+    if use_mask:
+        if not pos is None:
+            return [NestedTensor(inter_feat, mask) for inter_feat in interpolated_features], [pos[level]]*n_levels
+        else:
+            return [NestedTensor(inter_feat, mask) for inter_feat in interpolated_features], None
+    if not pos is None:
+        return interpolated_features, [pos[level]]*n_levels
+    else:
+        return interpolated_features, None
 
 
 class MultiheadAttention(nn.Module):
@@ -305,3 +361,16 @@ class FFN(nn.Module):
             identity = x
         return identity + self.dropout_layer(out)
 
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x

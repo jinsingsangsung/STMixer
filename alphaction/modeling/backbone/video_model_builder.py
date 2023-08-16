@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from .sfmodels import resnet_helper, stem_helper  # noqa
 import torch.utils.checkpoint as checkpoint
 from .vit_utils import PatchEmbed, get_sinusoid_encoding_table, Block, interpolate_pos_embed_online
+from ..stm_decoder.util.misc import NestedTensor
+from ..stm_decoder.transformer.position_encoding import build_position_encoding
 
 try:
     from fairscale.nn.checkpoint import checkpoint_wrapper
@@ -344,10 +346,20 @@ class SlowFast(nn.Module):
             norm_module=self.norm_module,
         )
 
-
+    def _init_position_encoding(self, cfg):
+        self.position_encoding = build_position_encoding(cfg.MODEL.STM.HIDDEN_DIM)
+        
     def forward(self, x):
         inputs = []
-        x = x[:]  # avoid pass by reference
+        use_mask = isinstance(x[0], NestedTensor)
+        if use_mask:
+            self._init_position_encoding(self.cfg)
+            tensors = []
+            masks = []
+            for x_ in x:
+                tensors.append(x_.tensors)
+                masks.append(x_.mask)
+            x = tensors[:]  # avoid pass by reference
         x = self.s1(x)
         x = self.s1_fuse(x)
         x = self.s2(x)
@@ -368,7 +380,18 @@ class SlowFast(nn.Module):
         x = self.s5(x)
         fm = torch.cat([x[0], F.max_pool3d(x[1], kernel_size=(self.alpha, 1, 1), stride=(self.alpha, 1, 1))], dim=1)
         inputs.append(fm)
-        return inputs
+        if use_mask:
+            out = []
+            pos = []
+            for input in inputs:
+                m = masks[0]
+                assert m is not None
+                mask = F.interpolate(m[None].float(), size=input.shape[-2:]).to(torch.bool)[0]
+                mask = mask.unsqueeze(1).repeat(1,input.shape[2],1,1)
+                out.append(NestedTensor(input, mask))
+                pos.append(self.position_encoding(NestedTensor(input, mask)))
+            return out, pos
+        return inputs, None
 
 
 
