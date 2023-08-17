@@ -520,10 +520,10 @@ class EncoderStage(nn.Module):
         self.dropout = dropout
         self.ffn_act = ffn_act
         self.proj_layers = nn.Sequential(
-            nn.Conv3d(3*feat_channels, feat_channels, (1,1,1)),
+            nn.Linear(3*feat_channels, feat_channels),
             nn.ReLU(),
-            # nn.Conv3d(feat_channels, feat_channels, (1,1,1)),
-            # nn.ReLU(),
+            nn.Linear(feat_channels, feat_channels),
+            nn.ReLU(),
         )
         self.offset_embed = nn.Sequential(
             nn.Linear(feat_channels//num_offsets, 3),
@@ -581,9 +581,9 @@ class EncoderStage(nn.Module):
         _, _, t, h, w, _ = sampled_pts.shape
         glob_context = features.mean(dim=(2,3,4), keepdim=True) # B, C, T, H, W, L
         glob_context_ = glob_context.expand(-1, -1, t, h, w, -1)
-        offset_src = rearrange(torch.cat([sampled_pts, sampled_pos, glob_context_], dim=1), 'B C T H W L -> (B L) C T H W')
+        offset_src = rearrange(torch.cat([sampled_pts, sampled_pos, glob_context_], dim=1), 'B C T H W L -> B T H W L C')
         import pdb; pdb.set_trace()
-        offset_src = self.proj_layers(offset_src) # BL, 3C, T, H, W -> BL, C, T, H, W
+        offset_src = self.proj_layers(offset_src) # B T H W L 3C -> B T H W L C
         offset_src = rearrange(offset_src, 'B T H W L (N_o d) -> B T H W L N_o d', N_o=N_o, d=C//N_o)
         import pdb; pdb.set_trace()
         offset = self.offset_embed(offset_src) # B T H W L N_o 3

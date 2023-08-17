@@ -8,6 +8,7 @@ DATA:
   TEST_MIN_SCALES: [ 256 ]
 AVA:
   ANNOTATION_DIR: "./annotations/"
+  TRAIN_LISTS: ["train_1000.csv"]
 MODEL:
   WEIGHT: "../pretrained_models/backbone/AVAV2_PYSLOWFAST_R50_8x8.pth"
   BACKBONE:
