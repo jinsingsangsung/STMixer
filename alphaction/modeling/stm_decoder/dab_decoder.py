@@ -9,11 +9,12 @@ from .util.adaptive_mixing_operator import AdaptiveMixing
 from .util.head_utils import _get_activation_layer, bias_init_with_prob, decode_box, position_embedding, make_interpolated_features, _get_clones
 from .util.misc import inverse_sigmoid
 from .util.head_utils import FFN, MLP, MultiheadAttention
+from .util.attention import MultiheadAttention_
 from .util.loss import SetCriterion, HungarianMatcher
 # from .transformer.dab_transformer import build_transformer
 from .util.misc import (NestedTensor, nested_tensor_from_tensor_list, inverse_sigmoid)
 from einops import rearrange, repeat
-
+import math
 
 class AdaptiveSTSamplingMixing(nn.Module):
 
@@ -94,6 +95,353 @@ class AdaptiveSTSamplingMixing(nn.Module):
         temporal_queries = self.norm_t(temporal_queries)
 
         return spatial_queries, temporal_queries
+
+
+class TransformerDecoder(nn.Module):
+
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False, 
+                    d_model=256, query_dim=2, keep_query_pos=False, query_scale_type='cond_elewise',
+                    modulate_hw_attn=False,
+                    bbox_embed_diff_each_layer=False,
+                    ):
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+        self.return_intermediate = return_intermediate
+        assert return_intermediate
+        self.query_dim = query_dim
+        assert query_scale_type in ['cond_elewise', 'cond_scalar', 'fix_elewise']
+        self.query_scale_type = query_scale_type
+        if query_scale_type == 'cond_elewise':
+            self.query_scale = MLP(d_model, d_model, d_model, 2)
+        elif query_scale_type == 'cond_scalar':
+            self.query_scale = MLP(d_model, d_model, 1, 2)
+        elif query_scale_type == 'fix_elewise':
+            self.query_scale = nn.Embedding(num_layers, d_model)
+        else:
+            raise NotImplementedError("Unknown query_scale_type: {}".format(query_scale_type))
+        
+        self.ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
+        
+        self.bbox_embed = None
+        self.d_model = d_model
+        self.modulate_hw_attn = modulate_hw_attn
+        self.bbox_embed_diff_each_layer = bbox_embed_diff_each_layer
+
+        if modulate_hw_attn:
+            self.ref_anchor_head = MLP(d_model, d_model, 2, 2)
+
+        if not keep_query_pos:
+            for layer_id in range(num_layers - 1):
+                self.layers[layer_id + 1].ca_qpos_proj = None
+
+        dim_feedforward = decoder_layer.dim_feedforward
+        dropout = decoder_layer.dropout_rate
+        self.activation = decoder_layer.activation
+        self.cls_norm = nn.LayerNorm(d_model)
+        self.cls_linear1 = nn.Linear(d_model, dim_feedforward)
+        self.cls_linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.conv_activation = _get_activation_layer(dict(type='RelU', inplace=True))
+
+        self.conv1 = nn.Conv2d(2*d_model, d_model, kernel_size=1)
+        self.conv2 = nn.Conv2d(d_model, d_model, kernel_size=1)
+        self.q_proj = nn.Conv2d(d_model, d_model, kernel_size=1)
+        self.k_proj = nn.Conv2d(d_model, d_model, kernel_size=1)
+        self.v_proj = nn.Conv2d(d_model, d_model, kernel_size=1)
+        
+        # self.cls_params = nn.Linear(d_model, 80).weight
+        # self.class_queries = nn.Embedding(80, 256).weight
+        # self.conv2 = nn.Conv2d(d_model, 2*d_model, kernel_size=3, stride=2)
+        # self.conv3 = nn.Conv2d(2*d_model, 2*d_model, kernel_size=3, stride=2)
+        self.linear = nn.Linear(d_model, d_model)
+        self.cls_norm_ = nn.LayerNorm(d_model)
+        self.cls_norm__ = nn.LayerNorm(d_model)
+        self.cls_linear1_ = nn.Linear(d_model, dim_feedforward)
+        self.cls_linear2_ = nn.Linear(dim_feedforward, d_model)
+        self.dropout_ = nn.Dropout(dropout)
+        
+        self.cls_norm2 = nn.LayerNorm(d_model)
+
+    def gen_sineembed_for_position(self, pos_tensor):
+            # n_query, bs, _ = pos_tensor.size()
+            # sineembed_tensor = torch.zeros(n_query, bs, 256)
+            scale = 2 * math.pi
+            dim_t = torch.arange(128, dtype=torch.float32, device=pos_tensor.device)
+            dim_t = 10000 ** (2 * (dim_t // 2) / 128)
+            x_embed = pos_tensor[:, :, 0] * scale
+            y_embed = pos_tensor[:, :, 1] * scale
+            pos_x = x_embed[:, :, None] / dim_t
+            pos_y = y_embed[:, :, None] / dim_t
+            pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+            pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
+            if pos_tensor.size(-1) == 2:
+                pos = torch.cat((pos_y, pos_x), dim=2)
+            elif pos_tensor.size(-1) == 4:
+                w_embed = pos_tensor[:, :, 2] * scale
+                pos_w = w_embed[:, :, None] / dim_t
+                pos_w = torch.stack((pos_w[:, :, 0::2].sin(), pos_w[:, :, 1::2].cos()), dim=3).flatten(2)
+
+                h_embed = pos_tensor[:, :, 3] * scale
+                pos_h = h_embed[:, :, None] / dim_t
+                pos_h = torch.stack((pos_h[:, :, 0::2].sin(), pos_h[:, :, 1::2].cos()), dim=3).flatten(2)
+
+                pos = torch.cat((pos_y, pos_x, pos_w, pos_h), dim=2)
+            else:
+                raise ValueError("Unknown pos_tensor shape(-1):{}".format(pos_tensor.size(-1)))
+            return pos
+
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                refpoints_unsigmoid: Optional[Tensor] = None, # num_queries, bs, 2
+                class_queries: Optional[Tensor] = None,
+                orig_res = None,
+                ):
+        output = tgt
+
+        intermediate = []
+        cls_intermediate = []
+        reference_points = refpoints_unsigmoid.sigmoid()
+        ref_points = [reference_points]
+
+        # import ipdb; ipdb.set_trace()        
+
+        for layer_id, layer in enumerate(self.layers):
+            obj_center = reference_points[..., :self.query_dim]     # [num_queries, batch_size, 2]
+            # get sine embedding for the query vector
+            query_sine_embed = self.gen_sineembed_for_position(obj_center)  
+            query_pos = self.ref_point_head(query_sine_embed) 
+
+            # For the first decoder layer, we do not apply transformation over p_s
+            if self.query_scale_type != 'fix_elewise':
+                if layer_id == 0:
+                    pos_transformation = 1
+                else:
+                    pos_transformation = self.query_scale(output)
+            else:
+                pos_transformation = self.query_scale.weight[layer_id]
+
+            # apply transformation
+            query_sine_embed = query_sine_embed[...,:self.d_model] * pos_transformation
+
+            # modulated HW attentions
+            if self.modulate_hw_attn:
+                refHW_cond = self.ref_anchor_head(output).sigmoid() # nq, bs*t, 2
+                query_sine_embed[..., self.d_model // 2:] *= (refHW_cond[..., 0] / obj_center[..., 2]).unsqueeze(-1)
+                query_sine_embed[..., :self.d_model // 2] *= (refHW_cond[..., 1] / obj_center[..., 3]).unsqueeze(-1)
+
+
+            output, actor_feature = layer(output, memory, tgt_mask=tgt_mask,
+                           memory_mask=memory_mask,
+                           tgt_key_padding_mask=tgt_key_padding_mask,
+                           memory_key_padding_mask=memory_key_padding_mask,
+                           pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
+                           is_first=(layer_id == 0))
+
+            # separate classification branch from localization
+            actor_feature = actor_feature.clone().detach()
+            actor_feature2 = self.cls_linear2(self.dropout(self.activation(self.cls_linear1(actor_feature))))
+            actor_feature = actor_feature + self.dropout(actor_feature2)
+            actor_feature = self.cls_norm(actor_feature)
+
+            # apply convolution
+            h, w = orig_res
+            actor_feature_expanded = actor_feature.flatten(0,1)[..., None, None].expand(-1, -1, h, w) # N_q*B, D, H, W
+            encoded_feature_expanded = memory[:, None].expand(-1, len(tgt), -1, -1).flatten(1,2).view(h,w,-1,actor_feature.shape[-1]).permute(2,3,0,1) # N_q*B, D, H, W
+
+            cls_feature = self.conv_activation(self.conv1(torch.cat([actor_feature_expanded, encoded_feature_expanded], dim=1)))
+            cls_feature = self.conv_activation(self.conv2(cls_feature))
+            # cls_feature = self.bn1(cls_feature)
+            query = self.q_proj(cls_feature)
+            query = query[:, None].expand(-1, 80, -1, -1, -1)
+            key = class_queries[None, :, :, None, None].expand(actor_feature_expanded.shape[0], -1, -1, h, w)
+            # key = self.cls_params[None, :, :, None, None].expand(actor_feature_expanded.shape[0], -1, -1, h, w)
+            attn = (query*key).sum(dim=2).flatten(2).softmax(dim=2).reshape(actor_feature_expanded.shape[0], -1, h, w)[:, :, None]
+            value = self.v_proj(encoded_feature_expanded)[:, None]
+            cls_output = (attn * value).sum(dim=-1).sum(dim=-1).view(len(tgt), -1, 80, cls_feature.shape[1]) #N_q, B, N_c, D
+            cls_output = self.linear(cls_output)
+            cls_output2 = self.cls_linear2_(self.dropout_(self.activation(self.cls_linear1_(cls_output))))
+            cls_output = cls_output + self.dropout_(cls_output2)
+            cls_output = self.cls_norm_(cls_output)
+            if layer_id != 0:
+                cls_output = self.cls_norm__(cls_output + prev_output)
+            prev_output = cls_output
+            
+            # iter update
+            if self.bbox_embed is not None:
+                if self.bbox_embed_diff_each_layer:
+                    tmp = self.bbox_embed[layer_id](output)
+                else:
+                    tmp = self.bbox_embed(output)
+                # import ipdb; ipdb.set_trace()
+                tmp[..., :self.query_dim] += inverse_sigmoid(reference_points)
+                new_reference_points = tmp[..., :self.query_dim].sigmoid()
+                if layer_id != self.num_layers - 1:
+                    ref_points.append(new_reference_points)
+                reference_points = new_reference_points.detach()
+
+            if self.return_intermediate:
+                intermediate.append(self.norm(output))
+                cls_intermediate.append(self.cls_norm2(cls_output))
+
+        if self.norm is not None:
+            output = self.norm(output)
+            cls_output = self.cls_norm2(cls_output)
+            if self.return_intermediate:
+                intermediate.pop()
+                intermediate.append(output)
+                cls_intermediate.pop()
+                cls_intermediate.append(cls_output)
+
+        if self.return_intermediate:
+            if self.bbox_embed is not None:
+                return [
+                    torch.stack(intermediate).transpose(1, 2),
+                    torch.stack(cls_intermediate).transpose(1, 2),
+                    torch.stack(ref_points).transpose(1, 2),
+                ]
+            else:
+                return [
+                    torch.stack(intermediate).transpose(1, 2), 
+                    torch.stack(cls_intermediate).transpose(1, 2),
+                    reference_points.unsqueeze(0).transpose(1, 2)
+                ]
+
+        return output.unsqueeze(0)
+
+
+class DecoderStage(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False, keep_query_pos=False,
+                 rm_self_attn_decoder=False):
+        super().__init__()
+        # Decoder Self-Attention
+        if not rm_self_attn_decoder:
+            self.sa_qcontent_proj = nn.Linear(d_model, d_model)
+            self.sa_qpos_proj = nn.Linear(d_model, d_model)
+            self.sa_kcontent_proj = nn.Linear(d_model, d_model)
+            self.sa_kpos_proj = nn.Linear(d_model, d_model)
+            self.sa_v_proj = nn.Linear(d_model, d_model)
+            self.self_attn = MultiheadAttention_(d_model, nhead, dropout=dropout, vdim=d_model)
+
+            self.norm1 = nn.LayerNorm(d_model)
+            self.dropout1 = nn.Dropout(dropout)
+
+        # Decoder Cross-Attention
+        self.ca_qcontent_proj = nn.Linear(d_model, d_model)
+        self.ca_qpos_proj = nn.Linear(d_model, d_model)
+        self.ca_kcontent_proj = nn.Linear(d_model, d_model)
+        self.ca_kpos_proj = nn.Linear(d_model, d_model)
+        self.ca_v_proj = nn.Linear(d_model, d_model)
+        self.ca_qpos_sine_proj = nn.Linear(d_model, d_model)
+        self.cross_attn = MultiheadAttention_(d_model*2, nhead, dropout=dropout, vdim=d_model)
+
+        self.nhead = nhead
+        self.rm_self_attn_decoder = rm_self_attn_decoder
+
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_layer(dict(type='RelU', inplace=True))
+        self.normalize_before = normalize_before
+        self.keep_query_pos = keep_query_pos
+
+        self.dim_feedforward = dim_feedforward
+        self.dropout_rate = dropout
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward(self, tgt, memory,
+                     tgt_mask: Optional[Tensor] = None,
+                     memory_mask: Optional[Tensor] = None,
+                     tgt_key_padding_mask: Optional[Tensor] = None,
+                     memory_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None,
+                     query_pos: Optional[Tensor] = None,
+                     query_sine_embed = None,
+                     is_first = False):
+                     
+        # ========== Begin of Self-Attention =============
+        if not self.rm_self_attn_decoder:
+            # Apply projections here
+            # shape: num_queries x batch_size x 256
+            q_content = self.sa_qcontent_proj(tgt)      # target is the input of the first decoder layer. zero by default.
+            q_pos = self.sa_qpos_proj(query_pos)
+            k_content = self.sa_kcontent_proj(tgt)
+            k_pos = self.sa_kpos_proj(query_pos)
+            v = self.sa_v_proj(tgt)
+
+            num_queries, bs, n_model = q_content.shape
+            hw, _, _ = k_content.shape
+
+            q = q_content + q_pos
+            k = k_content + k_pos
+
+            tgt2 = self.self_attn(q, k, value=v, attn_mask=tgt_mask,
+                                key_padding_mask=tgt_key_padding_mask)[0]
+            # ========== End of Self-Attention =============
+
+            tgt = tgt + self.dropout1(tgt2)
+            tgt = self.norm1(tgt)
+
+        # ========== Begin of Cross-Attention =============
+        # Apply projections here
+        # shape: num_queries x batch_size x 256
+        q_content = self.ca_qcontent_proj(tgt)
+        k_content = self.ca_kcontent_proj(memory)
+        v = self.ca_v_proj(memory)
+
+        num_queries, bs, n_model = q_content.shape
+        hw, _, _ = k_content.shape
+
+        k_pos = self.ca_kpos_proj(pos)
+
+        # For the first decoder layer, we concatenate the positional embedding predicted from 
+        # the object query (the positional embedding) into the original query (key) in DETR.
+        if is_first or self.keep_query_pos:
+            q_pos = self.ca_qpos_proj(query_pos)
+            q = q_content + q_pos
+            k = k_content + k_pos
+        else:
+            q = q_content
+            k = k_content
+
+        q = q.view(num_queries, bs, self.nhead, n_model//self.nhead)
+        query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
+        query_sine_embed = query_sine_embed.view(num_queries, bs, self.nhead, n_model//self.nhead)
+        q = torch.cat([q, query_sine_embed], dim=3).view(num_queries, bs, n_model * 2)
+        k = k.view(hw, bs, self.nhead, n_model//self.nhead)
+        k_pos = k_pos.view(hw, bs, self.nhead, n_model//self.nhead)
+        k = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)
+
+        tgt2 = self.cross_attn(query=q,
+                                   key=k,
+                                   value=v, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        # tgt2 = self.cross_attn(query=q,key=k,value=v, attn_mask=memory_mask,key_padding_mask=memory_key_padding_mask)[0]
+        # ========== End of Cross-Attention =============
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        tgt_temp = tgt
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt, tgt_temp
 
 
 class AMStage(nn.Module):
@@ -405,8 +753,6 @@ class DETR(nn.Module):
 
         if not isinstance(features, NestedTensor):
             features = nested_tensor_from_tensor_list(features)
-
-        import pdb; pdb.set_trace()
         
         srcs = []
         masks = []
@@ -506,8 +852,8 @@ class DETR(nn.Module):
 class EncoderStage(nn.Module):
     def __init__(self,
                  feat_channels=256,
-                 num_pts=8,
-                 num_offsets=8,
+                 num_pts=4,
+                 num_offsets=4,
                  num_levels=4,
                  feedforward_channels=2048,
                  dropout=0.1,
@@ -561,9 +907,6 @@ class EncoderStage(nn.Module):
         t_ = torch.full((B,L,N,1), T-1, device=displaced_indices.device)
         displaced_indices = (displaced_indices*torch.cat([t_, h_, w_], dim=-1)).round().long() # B, L, N, 3
         flat_indices = (H*W*displaced_indices[...,0] + W*displaced_indices[...,1] + displaced_indices[...,2]) # B, L, N
-        if not (flat_indices < T*H*W).all():
-            print("line 565")
-            import pdb; pdb.set_trace()
         return flat_indices
         
         
@@ -663,7 +1006,6 @@ class EncoderStage(nn.Module):
 
         flow_field = self.build_flow_field(features, offset, ind_pts) # BLN_o T H W 3
         
-        import pdb; pdb.set_trace()
         features_ = repeat(features, 'B C T H W L -> B N_o C T H W L', N_o=N_o)
         features_ = rearrange(features_, 'B N_o C T H W L -> (B L N_o) C T H W')
         # rearrange(repeat(features, 'B C T H W L -> B N_o C T H W L', N_o=N_o), 'B N_o C T H W L -> (B L N_o) C T H W')
@@ -682,7 +1024,6 @@ class EncoderStage(nn.Module):
         weight_o = weight_o_.scatter_(1, ind_pts_o, weight_o)
         weight_o = rearrange(weight_o, 'BLN_o (T H W) c -> BLN_o T H W c', T=T, H=H, W=W)
 
-        import pdb; pdb.set_trace()
         weighted_sampled_features = rearrange(
             sampled_features*weight_o, '(B L N_o) T H W C -> B N_o C T H W L', B=B, L=L, N_o=N_o).sum(dim=1)
         # this operation adds 2GB
@@ -695,7 +1036,6 @@ class EncoderStage(nn.Module):
         weight_l = rearrange(weight_l, 'B L (T H W) l -> B T H W L l', T=T, H=H, W=W)
         weight_l = repeat(weight_l, 'B T H W L l -> B c T H W L l', c=1)
     
-        import pdb; pdb.set_trace()
         features = (features[..., None]*weight_l).sum(dim=-1) # B C T H W L
 
         features = self.norm(features.transpose(1,-1).contiguous()).transpose(1,-1).contiguous()
@@ -712,38 +1052,18 @@ class STMDecoder(nn.Module):
         self.device = torch.device('cuda')
 
         self._generate_queries(cfg)
-        # transformer = build_transformer(cfg)
-        # self.model = DETR(transformer=transformer,
-        #                   num_classes=cfg.MODEL.STM.ACTION_CLASSES,
-        #                   num_queries=cfg.MODEL.STM.NUM_QUERIES,
-        #                   num_frames=cfg.DATA.NUM_FRAMES,
-        #                   hidden_dim=cfg.MODEL.STM.HIDDEN_DIM,
-        #                   temporal_length=cfg.DATA.NUM_FRAMES)
-        self.num_stages = cfg.MODEL.STM.NUM_ENC_STAGES
-        self.num_stages = cfg.MODEL.STM.NUM_STAGES
-        self.decoder_stages = nn.ModuleList()
-        for i in range(self.num_stages):
-            decoder_stage = AMStage(
-                query_dim=cfg.MODEL.STM.HIDDEN_DIM,
-                feat_channels=cfg.MODEL.STM.HIDDEN_DIM,
-                num_heads=cfg.MODEL.STM.NUM_HEADS,
-                feedforward_channels=cfg.MODEL.STM.DIM_FEEDFORWARD,
-                dropout=cfg.MODEL.STM.DROPOUT,
-                num_ffn_fcs=cfg.MODEL.STM.NUM_FCS,
-                ffn_act=cfg.MODEL.STM.ACTIVATION,
-                spatial_points=cfg.MODEL.STM.SPATIAL_POINTS,
-                temporal_points=cfg.MODEL.STM.TEMPORAL_POINTS,
-                out_multiplier=cfg.MODEL.STM.OUT_MULTIPLIER,
-                n_groups=cfg.MODEL.STM.N_GROUPS,
-                num_cls_fcs=cfg.MODEL.STM.NUM_CLS,
-                num_reg_fcs=cfg.MODEL.STM.NUM_REG,
-                num_action_fcs=cfg.MODEL.STM.NUM_ACT,
-                num_classes_object=cfg.MODEL.STM.OBJECT_CLASSES,
-                num_classes_action=cfg.MODEL.STM.ACTION_CLASSES
-                )
-            self.decoder_stages.append(decoder_stage)
+        self.num_enc_stages = cfg.MODEL.STM.NUM_ENC_STAGES
+        self.num_dec_stages = cfg.MODEL.STM.NUM_STAGES
         self.encoder_stages = nn.ModuleList()
-        for i in range(self.num_stages):
+        self.decoder_stages = nn.ModuleList()
+        self.query_dim = 4
+        self.eff = True
+        self.d_model = cfg.MODEL.STM.HIDDEN_DIM
+        assert self.query_dim in [2, 4]
+        self.query_scale_type = 'cond_elewise'
+        assert self.query_scale_type in ['cond_elewise', 'cond_scalar', 'fix_elewise']        
+        
+        for i in range(self.num_enc_stages):
             encoder_stage = EncoderStage(
                 feat_channels=cfg.MODEL.STM.HIDDEN_DIM,
                 num_pts=cfg.MODEL.STM.SAMPLING_POINTS,
@@ -752,6 +1072,38 @@ class STMDecoder(nn.Module):
                 ffn_act=cfg.MODEL.STM.ACTIVATION,
             )
             self.encoder_stages.append(encoder_stage)
+        # for i in range(self.num_stages):
+        #     decoder_stage = DecoderStage(
+        #         d_model=cfg.MODEL.STM.HIDDEN_DIM,
+        #         num_heads=cfg.MODEL.STM.NUM_HEADS,
+        #         dim_feedforward=cfg.MODEL.STM.DIM_FEEDFORWARD,
+        #         dropout=cfg.MODEL.STM.DROPOUT,
+        #         activation=cfg.MODEL.STM.ACTIVATION,
+        #         normalize_before=False,
+        #         keep_query_pos=False,
+        #         )
+        #     self.decoder_stages.append(decoder_stage)
+        
+        decoder_layer = DecoderStage(
+                d_model=cfg.MODEL.STM.HIDDEN_DIM,
+                nhead=cfg.MODEL.STM.NUM_HEADS,
+                dim_feedforward=cfg.MODEL.STM.DIM_FEEDFORWARD,
+                dropout=cfg.MODEL.STM.DROPOUT,
+                activation=cfg.MODEL.STM.ACTIVATION,
+                )
+        
+        decoder_norm = nn.LayerNorm(cfg.MODEL.STM.HIDDEN_DIM)
+        self.decoder = TransformerDecoder(decoder_layer,
+                                          num_layers=self.num_dec_stages,
+                                          norm=decoder_norm,
+                                          return_intermediate=True,
+                                          d_model=cfg.MODEL.STM.HIDDEN_DIM,
+                                          query_dim=self.query_dim,
+                                          keep_query_pos=False,
+                                          modulate_hw_attn=True,
+                                          bbox_embed_diff_each_layer=False
+        )
+        
         object_weight = cfg.MODEL.STM.OBJECT_WEIGHT
         giou_weight = cfg.MODEL.STM.GIOU_WEIGHT
         l1_weight = cfg.MODEL.STM.L1_WEIGHT
@@ -772,7 +1124,7 @@ class STMDecoder(nn.Module):
 
         self.intermediate_supervision = cfg.MODEL.STM.INTERMEDIATE_SUPERVISION
         if self.intermediate_supervision:
-            for i in range(self.num_stages - 1):
+            for i in range(self.num_dec_stages - 1):
                 inter_weight_dict = {k + f"_{i}": v for k, v in weight_dict.items()}
                 weight_dict.update(inter_weight_dict)
 
@@ -841,39 +1193,59 @@ class STMDecoder(nn.Module):
 
         return targets
 
-
-
     def forward(self, features, pos, whwh, gt_boxes, labels, extras={}, part_forward=-1):
         """
         features: list of tensors
         each element is of shape B, 
         """
         features, pos = make_interpolated_features(features, pos, num_frames=self.num_frames, level=2)
-        srcs = torch.stack([feature.tensors for feature in features], dim=-1)
-        masks = torch.stack([feature.mask for feature in features], dim=-1)
-        pos = torch.stack(pos, dim=-1)
+        srcs = torch.stack([feature.tensors for feature in features], dim=-1) # B, C, T, H, W, L
+        masks = torch.stack([feature.mask for feature in features], dim=-1) # B, T, H, W, L        
+        pos = torch.stack(pos, dim=-1) # B, C, T, H, W, L
+
         ind = None
-        import pdb; pdb.set_trace()
+
         for l, encoder_stage in enumerate(self.encoder_stages):
             srcs, ind = encoder_stage(srcs, pos, ind)
             print("stage ", l, " passed")
-            import pdb; pdb.set_trace()
+
         spatial_queries, class_queries = self._decode_init_queries(whwh)
-
-        inter_class_logits = []
-        inter_pred_bboxes = []
-        inter_action_logits = []
-        B, N, _ = spatial_queries.size()
-
-        for decoder_stage in self.decoder_stages:
-            objectness_score, action_score, delta_xyzr, spatial_queries, temporal_queries = \
-                decoder_stage(features, proposal_boxes, spatial_queries, temporal_queries)
-            proposal_boxes, pred_boxes = decoder_stage.refine_xyzr(proposal_boxes, delta_xyzr)
-
-            inter_class_logits.append(objectness_score)
-            inter_pred_bboxes.append(pred_boxes)
-            inter_action_logits.append(action_score)
-
+        # B, N_q, query_dim // N_c, D
+        # inter_class_logits = []
+        # inter_pred_bboxes = []
+        # inter_action_logits = []
+        
+        B, C, T, H, W, L = srcs.shape
+        
+        mask = features[-1].mask # B, T, H, W
+        pos = pos[..., -1] # B, C, T, H, W
+        
+        N_q = self.num_queries
+        refpoint_embed = spatial_queries.transpose(0,1)
+        memory = rearrange(srcs.mean(dim=-1), 'B C T H W -> (H W) (B T) C')
+        mask = rearrange(mask, 'B T H W -> B T (H W)')
+        pos_embed = rearrange(pos, 'B C T H W -> (H W) (B T) C')
+        tgt = torch.zeros(N_q, B*T, self.d_model, device=refpoint_embed.device)
+        if self.eff:
+            memory = memory.reshape(-1, B, T, C)[:,:,T//2:T//2+1,:].flatten(1,2)
+            pos_embed = pos_embed.reshape(-1, B, T, C)[:,:,T//2:T//2+1,:].flatten(1,2)
+            mask = mask.reshape(B, T, -1)[:,T//2:T//2+1,:].flatten(0,1)
+            tgt = torch.zeros(N_q, B, self.d_model, device=refpoint_embed.device)
+        else:
+            tgt = torch.zeros(N_q, B*T, self.d_model, device=refpoint_embed.device)        
+        
+        hs, cls_hs, references = self.decoder(tgt,
+                                              memory,
+                                              memory_key_padding_mask=mask, 
+                                              pos=pos_embed,
+                                              refpoints_unsigmoid=refpoint_embed,
+                                              class_queries=class_queries,
+                                              orig_res=(H,W))            
+        
+        import pdb; pdb.set_trace()
+            # objectness_score, action_score, delta_xyzr, spatial_queries, temporal_queries = \
+                # decoder_stage(features, proposal_boxes, spatial_queries, temporal_queries)
+            # proposal_boxes, pred_boxes = decoder_stage.refine_xyzr(proposal_boxes, delta_xyzr)
 
         if not self.training:
             action_scores = torch.sigmoid(inter_action_logits[-1])

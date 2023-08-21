@@ -8,7 +8,7 @@ DATA:
   TEST_MIN_SCALES: [ 256 ]
 AVA:
   ANNOTATION_DIR: "./annotations/"
-  TRAIN_LISTS: ["train.csv"]
+  TRAIN_LISTS: ["train_1000.csv"]
 MODEL:
   WEIGHT: "../pretrained_models/backbone/AVAV2_PYSLOWFAST_R50_8x8.pth"
   BACKBONE:
@@ -16,7 +16,7 @@ MODEL:
     PATHWAYS: 2
     FROZEN_BN: False # setting True may be better
   STM:
-    NUM_QUERIES: 100
+    NUM_QUERIES: 20
     HIDDEN_DIM: 256
     NUM_STAGES: 6
     NUM_ENC_STAGES: 6
