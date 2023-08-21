@@ -508,6 +508,7 @@ class EncoderStage(nn.Module):
                  feat_channels=256,
                  num_pts=8,
                  num_offsets=8,
+                 num_levels=4,
                  feedforward_channels=2048,
                  dropout=0.1,
                  ffn_act='RelU',):
@@ -527,88 +528,180 @@ class EncoderStage(nn.Module):
         )
         self.offset_embed = nn.Sequential(
             nn.Linear(feat_channels//num_offsets, 3),
-            nn.Sigmoid(),
         )
-        self.weight_embed = nn.Sequential(
+        self.weight_o_embed = nn.Sequential(
             nn.Linear(feat_channels//num_offsets, 2),
             nn.Softmax(dim=-1),
         )
+        self.weight_l_embed = nn.Sequential(
+            nn.Linear(feat_channels, num_levels),
+            nn.Softmax(dim=-1),
+        )
+        self.next_embed = nn.Sequential(
+            nn.Linear(feat_channels, 3),
+        )
+        self.norm = nn.LayerNorm(feat_channels)
 
-    def build_flow_field(self, x: torch.Tensor, H, W, L):
-        BT, HWL, L, N_p, _ = x.shape
+    def offset_adder(self, x, offset, indices):
+        """
+        offset: B, L, N, 3
+        indices: a tensor of shape B, L, N
+        
+        return: flattened tensor of displaced indices
+        """
+        B, C, T, H, W, L = x.shape
+        N = offset.size(2)
+        w_indices = indices % W / (W-1) # B, L, N
+        h_indices = indices // W % H / (H-1) # B, L, N
+        t_indices = indices // W // H / (T-1) # B, L, N
+        thw_indices = torch.stack([t_indices, h_indices, w_indices], dim=-1) # B, L, N, 3
+        displaced_indices = (inverse_sigmoid(thw_indices) + offset).sigmoid() # B, L, N, 3
+        w_ = torch.full((B,L,N,1), W-1, device=displaced_indices.device)
+        h_ = torch.full((B,L,N,1), H-1, device=displaced_indices.device)
+        t_ = torch.full((B,L,N,1), T-1, device=displaced_indices.device)
+        displaced_indices = (displaced_indices*torch.cat([t_, h_, w_], dim=-1)).round().long() # B, L, N, 3
+        flat_indices = (H*W*displaced_indices[...,0] + W*displaced_indices[...,1] + displaced_indices[...,2]) # B, L, N
+        if not (flat_indices < T*H*W).all():
+            print("line 565")
+            import pdb; pdb.set_trace()
+        return flat_indices
+        
+        
+    def build_flow_field(self, x, offset, indices):
+        """
+        x: B, C, T, H, W, L
+        offset: B L N_o N c
+        indices: a tensor of shape B, L, N
+
+        output: flow field with updated indices of shape BLN_o, T, H, W, 3
+        """
+        B, C, T, H, W, L = x.shape
+        N_o = self.num_offsets
+        indices = repeat(indices, 'B L N -> B L N_o N', N_o=N_o)
+        indices = rearrange(indices, 'B L N_o N -> (B L N_o) N')
+        indices_ = repeat(indices, 'BLN_o N -> BLN_o N c', c=3)
+        
+        w_indices = indices % W / (W-1) # BLN_o, N
+        h_indices = indices // W % H / (H-1) # BLN_o, N
+        t_indices = indices // W // H / (T-1) # BLN_o, N
+        thw_indices = torch.stack([t_indices, h_indices, w_indices], dim=-1) # BLN_o, N, 3
+
+        sampled_indices = (inverse_sigmoid(thw_indices) + offset).sigmoid()
+        src = sampled_indices*2 - 1 # BLN_o, N, 3
+        
+        # Build a grid
+        dt = torch.linspace(-1, 1, T, device=x.device)
         dh = torch.linspace(-1, 1, H, device=x.device)
         dw = torch.linspace(-1, 1, W, device=x.device)
-        dl = torch.linspace(-1, 1, L, device=x.device)
-        meshh, meshw, meshl = torch.meshgrid((dh, dw, dl))
-        grid = torch.stack((meshh, meshw, meshl), -1) # H, W, L, 3
-        grid = repeat(grid, 'H W L c -> BT H W L LN_p c', BT=BT, LN_p=L*N_p)
-        grid = rearrange(grid, 'BT H W L LN_p c -> BT (H W L) LN_p c')
-        return grid
+        mesht, meshh, meshw = torch.meshgrid((dt, dh, dw))
+        grid = torch.stack((mesht, meshh, meshw), -1) # T, H, W, 3
+        grid = repeat(grid, 'T H W c -> B L N_o T H W c', B=B, L=L, N_o=N_o)
+        grid = rearrange(grid, 'B L N_o T H W c-> (B L N_o) (T H W) c')
+        
+        # Update the grid
+        flow_field = grid.clone().scatter_(1, indices_, src) # (B L N_o) THW 3
+        flow_field = rearrange(flow_field, 'BLN_o (T H W) c -> BLN_o T H W c', T=T, H=H, W=W)
+
+        return flow_field
     
-    def uniform_select(self, x, num_pts):
+    def select_at(self, x, num_pts, indices=None):
         """
-        uniformly selects num_pts for each dimension:
+        selects num_pts of selected indices for each dimension.
+        if no indices are given, uniformly sample.
+        indices: B, L, N (flattened)
         input: B, C, T, H, W, L
         output: B, C, num_pts, num_pts, num_pts, L
         """
         B, C, T, H, W, L = x.shape
-        hop_h = H//num_pts
-        hop_w = W//num_pts
-        hop_t = T//num_pts
-        t_indices = torch.linspace(0+hop_t/2,T-hop_t/2,num_pts, device=x.device).round().long()
-        h_indices = torch.linspace(0+hop_h/2,H-hop_h/2,num_pts, device=x.device).round().long()
-        w_indices = torch.linspace(0+hop_w/2,W-hop_w/2,num_pts, device=x.device).round().long()        
-        sampled_pts = x.index_select(
-            dim=2, index=t_indices
-            ).index_select(
-                dim=3, index=h_indices
-                ).index_select(
-                    dim=4, index=w_indices
-                    ) # B, C, num_pts, num_pts, num_pts, L
+        if not indices is None:
+            flat_indices = indices
+        else: # uniformly sample
+            hop_t = T/num_pts
+            hop_h = H/num_pts
+            hop_w = W/num_pts 
+            t_indices = torch.linspace(0+hop_t/2, T-1-hop_t/2, num_pts, device=x.device).round().long()
+            h_indices = torch.linspace(0+hop_h/2, H-1-hop_h/2, num_pts, device=x.device).round().long()
+            w_indices = torch.linspace(0+hop_w/2, W-1-hop_w/2, num_pts, device=x.device).round().long()
+
+            # make it to 1d coordinate tensor
+            t_indices = repeat(t_indices, 'n_t -> B L n_t n_h n_w', B=B, L=L, n_h = num_pts, n_w = num_pts).flatten(2)
+            h_indices = repeat(h_indices, 'n_h -> B L n_t n_h n_w', B=B, L=L, n_t = num_pts, n_w = num_pts).flatten(2)
+            w_indices = repeat(w_indices, 'n_w -> B L n_t n_h n_w', B=B, L=L, n_t = num_pts, n_h = num_pts).flatten(2)
+
+            indices = torch.stack([t_indices, h_indices, w_indices], dim=3) # B, L, N, 3
+
+            flat_indices = (H*W*indices[:,:,:,0] + W*indices[:,:,:,1] + indices[:,:,:,2]) # B, L, N
+
+        flat_indices_ = repeat(flat_indices, 'B L N -> B L N C', C=C)
         
-        return sampled_pts
+        x_ = rearrange(x, 'B C T H W L -> B L (T H W) C')
+        sampled_pts = x_.gather(dim=2, index=flat_indices_) # B, L, N, C
+
+        return sampled_pts, flat_indices
         
     
-    def forward(self, features, pos, layer):
+    def forward(self, features, pos, ind=None):
         B, C, T, H, W, L = features.shape
-        BT = B*T
-        HWL = H*W*L
+        THW = T*H*W
         N_o = self.num_offsets
         N_p = self.num_pts
-        # features = rearrange(features, 'B C T H W L -> (B T) C H W L')
-        sampled_pts = self.uniform_select(features, N_p)
-        sampled_pos = self.uniform_select(pos, N_p)
-        _, _, t, h, w, _ = sampled_pts.shape
-        glob_context = features.mean(dim=(2,3,4), keepdim=True) # B, C, T, H, W, L
-        glob_context_ = glob_context.expand(-1, -1, t, h, w, -1)
-        offset_src = rearrange(torch.cat([sampled_pts, sampled_pos, glob_context_], dim=1), 'B C T H W L -> B T H W L C')
-        import pdb; pdb.set_trace()
-        offset_src = self.proj_layers(offset_src) # B T H W L 3C -> B T H W L C
-        offset_src = rearrange(offset_src, 'B T H W L (N_o d) -> B T H W L N_o d', N_o=N_o, d=C//N_o)
-        import pdb; pdb.set_trace()
-        offset = self.offset_embed(offset_src) # B T H W L N_o 3
-        weight = self.weight_embed(offset_src)[..., 1:] # B T H W L N_o 1
-        import pdb; pdb.set_trace()
-        dl = torch.linspace(0, 1, L, device=offset.device)[None, None, ..., None, None].expand(BT, HWL, -1, N_o, -1)
-        flow_field = self.build_flow_field(offset, H, W, L) # BT (H W L) LN_o c
-        offset = rearrange(torch.cat([offset, dl], dim=-1), 'bt hwl l n_o d -> bt hwl (l n_o) d')
-        sample_points = (inverse_sigmoid(flow_field) + offset).sigmoid()
+        sampled_pts, ind_pts = self.select_at(features, N_p, ind)
+        sampled_pos, ind_pos = self.select_at(pos, N_p, ind)
 
-        sample_points = rearrange(sample_points, 'bt (h w l) ln_o c -> (bt ln_o) h w l c', h=H, w=W, l=L)
-        features_ = repeat(features, 'bt c h w l -> bt ln_o c h w l', ln_o=L*N_o)
-        features_ = rearrange(features_, 'bt ln_o c h w l -> (bt ln_o) c h w l')
+        _, _, N, _ = sampled_pts.shape
+        glob_context = features.mean(dim=(2,3,4)) # B C T H W L
+        glob_context_ = repeat(glob_context, 'B C L -> B L N C', N=N)
+        offset_src = torch.cat([sampled_pts, sampled_pos, glob_context_], dim=-1)
+        offset_src = self.proj_layers(offset_src) # B L N 3C -> B L N C
+        next = self.next_embed(offset_src) # B L N 3
+        weight_l = self.weight_l_embed(offset_src) # B L N L
+        
+        offset_src = rearrange(offset_src, 'B L N (N_o d) -> (B L N_o) N d', N_o=N_o, d=C//N_o)
+        offset = self.offset_embed(offset_src) # BLN_o N 3
+        weight_o = self.weight_o_embed(offset_src)[..., 1:] # BLN_o N 1
+        
+
+        flow_field = self.build_flow_field(features, offset, ind_pts) # BLN_o T H W 3
+        
+        import pdb; pdb.set_trace()
+        features_ = repeat(features, 'B C T H W L -> B N_o C T H W L', N_o=N_o)
+        features_ = rearrange(features_, 'B N_o C T H W L -> (B L N_o) C T H W')
+        # rearrange(repeat(features, 'B C T H W L -> B N_o C T H W L', N_o=N_o), 'B N_o C T H W L -> (B L N_o) C T H W')
+        ## here the memory increases by 1.2GB
+
         sampled_features = F.grid_sample(
-            features_, sample_points,
+            features_, flow_field,
             mode='bilinear', padding_mode='zeros', align_corners=False,
-        )
+        ) # (B L N_o) C THW 
+        ## 1.5GB
         
-        sampled_features = rearrange(sampled_features, '(bt ln_o) c h w l -> bt ln_o c h w l', bt=BT, ln_o=L*N_o)
-        weight = rearrange(weight, 'bt (h w l2) l n_o c -> bt (l n_o) c h w l2', h=H, w=W, l2=L)
-        features = features + (sampled_features*weight).sum(dim=1)
-        
-        features = rearrange(features, '(b t) c h w l -> b c t h w l', b=B, t=T)
+        sampled_features = rearrange(sampled_features, 'BLN_o C T H W -> BLN_o T H W C')
+        weight_o_ = torch.zeros((B*L*N_o, THW, 1), device=weight_o.device)
+        ind_pts_o = repeat(ind_pts, 'B L N -> B L N_o N c', N_o=N_o, c=1)
+        ind_pts_o = rearrange(ind_pts_o, 'B L N_o N c -> (B L N_o) N c')
+        weight_o = weight_o_.scatter_(1, ind_pts_o, weight_o)
+        weight_o = rearrange(weight_o, 'BLN_o (T H W) c -> BLN_o T H W c', T=T, H=H, W=W)
 
-        return features
+        import pdb; pdb.set_trace()
+        weighted_sampled_features = rearrange(
+            sampled_features*weight_o, '(B L N_o) T H W C -> B N_o C T H W L', B=B, L=L, N_o=N_o).sum(dim=1)
+        # this operation adds 2GB
+        
+        features = features+weighted_sampled_features
+        
+        weight_l_ = torch.zeros((B, L, THW, L), device=weight_l.device)
+        ind_pts_l = repeat(ind_pts, 'B L N -> B L N C', C=4)
+        weight_l = weight_l_.scatter_(2, ind_pts_l, weight_l) # B L THW L
+        weight_l = rearrange(weight_l, 'B L (T H W) l -> B T H W L l', T=T, H=H, W=W)
+        weight_l = repeat(weight_l, 'B T H W L l -> B c T H W L l', c=1)
+    
+        import pdb; pdb.set_trace()
+        features = (features[..., None]*weight_l).sum(dim=-1) # B C T H W L
+
+        features = self.norm(features.transpose(1,-1).contiguous()).transpose(1,-1).contiguous()
+
+        next_ind = self.offset_adder(features, next, ind_pts)
+        return features, next_ind
 
 
 class STMDecoder(nn.Module):
@@ -626,7 +719,7 @@ class STMDecoder(nn.Module):
         #                   num_frames=cfg.DATA.NUM_FRAMES,
         #                   hidden_dim=cfg.MODEL.STM.HIDDEN_DIM,
         #                   temporal_length=cfg.DATA.NUM_FRAMES)
-        self.num_stages = cfg.MODEL.STM.NUM_STAGES
+        self.num_stages = cfg.MODEL.STM.NUM_ENC_STAGES
         self.num_stages = cfg.MODEL.STM.NUM_STAGES
         self.decoder_stages = nn.ModuleList()
         for i in range(self.num_stages):
@@ -759,10 +852,12 @@ class STMDecoder(nn.Module):
         srcs = torch.stack([feature.tensors for feature in features], dim=-1)
         masks = torch.stack([feature.mask for feature in features], dim=-1)
         pos = torch.stack(pos, dim=-1)
+        ind = None
+        import pdb; pdb.set_trace()
         for l, encoder_stage in enumerate(self.encoder_stages):
-            srcs = encoder_stage(srcs, pos, l)
-            print(l)
-
+            srcs, ind = encoder_stage(srcs, pos, ind)
+            print("stage ", l, " passed")
+            import pdb; pdb.set_trace()
         spatial_queries, class_queries = self._decode_init_queries(whwh)
 
         inter_class_logits = []

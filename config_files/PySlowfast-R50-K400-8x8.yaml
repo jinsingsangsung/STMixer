@@ -8,7 +8,7 @@ DATA:
   TEST_MIN_SCALES: [ 256 ]
 AVA:
   ANNOTATION_DIR: "./annotations/"
-  TRAIN_LISTS: ["train_1000.csv"]
+  TRAIN_LISTS: ["train.csv"]
 MODEL:
   WEIGHT: "../pretrained_models/backbone/AVAV2_PYSLOWFAST_R50_8x8.pth"
   BACKBONE:
@@ -19,6 +19,7 @@ MODEL:
     NUM_QUERIES: 100
     HIDDEN_DIM: 256
     NUM_STAGES: 6
+    NUM_ENC_STAGES: 6
     ACTION_CLASSES: 80
     OBJECT_CLASSES: 1
     NUM_HEADS: 8
@@ -26,7 +27,7 @@ MODEL:
     DIM_FEEDFORWARD: 2048
     NUM_FCS: 2
     ACTIVATION: 'ReLU'
-    SAMPLING_POINTS: 8 #####
+    SAMPLING_POINTS: 5 #####
     SPATIAL_POINTS: 32
     TEMPORAL_POINTS: 8
     OUT_MULTIPLIER: 4

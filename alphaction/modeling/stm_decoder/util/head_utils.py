@@ -140,10 +140,12 @@ def make_interpolated_features(features, pos=None, num_frames=32, level=0):
             )
     if use_mask:
         if not pos is None:
+            pos[level] = pos[level].repeat(1, 1, num_frames//pos[level].size(2), 1, 1)
             return [NestedTensor(inter_feat, mask) for inter_feat in interpolated_features], [pos[level]]*n_levels
         else:
             return [NestedTensor(inter_feat, mask) for inter_feat in interpolated_features], None
     if not pos is None:
+        pos[level] = pos[level][:,:,None].repeat(1, 1, num_frames//pos[level].size(2), 1, 1, 1)
         return interpolated_features, [pos[level]]*n_levels
     else:
         return interpolated_features, None
