@@ -1058,7 +1058,8 @@ class STMDecoder(nn.Module):
         self.decoder_stages = nn.ModuleList()
         self.query_dim = 4
         self.eff = True
-        self.d_model = cfg.MODEL.STM.HIDDEN_DIM
+        d_model = cfg.MODEL.STM.HIDDEN_DIM
+        self.d_model = d_model
         assert self.query_dim in [2, 4]
         self.query_scale_type = 'cond_elewise'
         assert self.query_scale_type in ['cond_elewise', 'cond_scalar', 'fix_elewise']        
@@ -1103,7 +1104,17 @@ class STMDecoder(nn.Module):
                                           modulate_hw_attn=True,
                                           bbox_embed_diff_each_layer=False
         )
+        self.bbox_embed = MLP(d_model, d_model, 4, 3)
+        self.class_embed_b = self.class_embed_b = nn.Linear(d_model, 3)
+        nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
+
+        self.iter_update = True
+        if self.iter_update:
+            self.decoder.bbox_embed = self.bbox_embed
         
+        self.dropout = nn.Dropout(0.5)
+
         object_weight = cfg.MODEL.STM.OBJECT_WEIGHT
         giou_weight = cfg.MODEL.STM.GIOU_WEIGHT
         l1_weight = cfg.MODEL.STM.L1_WEIGHT
@@ -1166,8 +1177,8 @@ class STMDecoder(nn.Module):
 
     def person_detector_loss(self, outputs_class, outputs_coord, criterion, targets, outputs_actions):
         if self.intermediate_supervision:
-            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_actions':outputs_actions[-1],
-                      'aux_outputs': [{'pred_logits': a, 'pred_boxes': b, 'pred_actions':c}
+            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_actions': outputs_actions[-1],
+                      'aux_outputs': [{'pred_logits': a, 'pred_boxes': b, 'pred_actions': c}
                                       for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_actions[:-1])]}
         else:
             raise NotImplementedError
@@ -1217,7 +1228,7 @@ class STMDecoder(nn.Module):
         
         B, C, T, H, W, L = srcs.shape
         
-        mask = features[-1].mask # B, T, H, W
+        mask = masks[..., -1] # B, T, H, W
         pos = pos[..., -1] # B, C, T, H, W
         
         N_q = self.num_queries
@@ -1225,7 +1236,7 @@ class STMDecoder(nn.Module):
         memory = rearrange(srcs.mean(dim=-1), 'B C T H W -> (H W) (B T) C')
         mask = rearrange(mask, 'B T H W -> B T (H W)')
         pos_embed = rearrange(pos, 'B C T H W -> (H W) (B T) C')
-        tgt = torch.zeros(N_q, B*T, self.d_model, device=refpoint_embed.device)
+
         if self.eff:
             memory = memory.reshape(-1, B, T, C)[:,:,T//2:T//2+1,:].flatten(1,2)
             pos_embed = pos_embed.reshape(-1, B, T, C)[:,:,T//2:T//2+1,:].flatten(1,2)
@@ -1234,22 +1245,31 @@ class STMDecoder(nn.Module):
         else:
             tgt = torch.zeros(N_q, B*T, self.d_model, device=refpoint_embed.device)        
         
-        hs, cls_hs, references = self.decoder(tgt,
+        hs, cls_hs, reference = self.decoder(tgt,
                                               memory,
                                               memory_key_padding_mask=mask, 
                                               pos=pos_embed,
                                               refpoints_unsigmoid=refpoint_embed,
                                               class_queries=class_queries,
                                               orig_res=(H,W))            
-        
-        import pdb; pdb.set_trace()
             # objectness_score, action_score, delta_xyzr, spatial_queries, temporal_queries = \
                 # decoder_stage(features, proposal_boxes, spatial_queries, temporal_queries)
             # proposal_boxes, pred_boxes = decoder_stage.refine_xyzr(proposal_boxes, delta_xyzr)
-
+        
+        outputs_class_b = self.class_embed_b(hs)
+        reference_before_sigmoid = inverse_sigmoid(reference)
+        tmp = self.bbox_embed(hs)
+        tmp[..., :self.query_dim] += reference_before_sigmoid
+        outputs_coord = tmp.sigmoid()
+        
+        if not self.eff:
+            outputs_class = self.dropout(cls_hs).mean(dim=-1).reshape(-1, B*T, N_q, self.num_classes)
+        else:
+            outputs_class = self.dropout(cls_hs).mean(dim=-1).reshape(-1, B, N_q, self.num_classes)
+        
         if not self.training:
-            action_scores = torch.sigmoid(inter_action_logits[-1])
-            scores = F.softmax(inter_class_logits[-1], dim=-1)[:, :, 0]
+            action_scores = torch.sigmoid(outputs_class[-1])
+            scores = F.softmax(outputs_class_b[-1], dim=-1)[:, :, 0]
             # scores: B*100
             action_score_list = []
             box_list = []
@@ -1259,7 +1279,7 @@ class STMDecoder(nn.Module):
                     _,selected_idx = torch.topk(scores[i],k=3,dim=-1)
 
                 action_score = action_scores[i][selected_idx]
-                box = inter_pred_bboxes[-1][i][selected_idx]
+                box = outputs_coord[-1][i][selected_idx]
                 cur_whwh = whwh[i]
                 box = clip_boxes_tensor(box, cur_whwh[1], cur_whwh[0])
                 box[:, 0::2] /= cur_whwh[0]
@@ -1270,7 +1290,7 @@ class STMDecoder(nn.Module):
 
 
         targets = self.make_targets(gt_boxes, whwh, labels)
-        losses = self.person_detector_loss(inter_class_logits, inter_pred_bboxes, self.criterion, targets, inter_action_logits)
+        losses = self.person_detector_loss(outputs_class_b, outputs_coord, self.criterion, targets, outputs_class)
         weight_dict = self.criterion.weight_dict
         for k in losses.keys():
             if k in weight_dict:

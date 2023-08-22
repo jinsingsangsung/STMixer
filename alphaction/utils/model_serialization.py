@@ -20,8 +20,10 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, no_head):
     we want to match backbone[0].body.conv1.weight to conv1.weight, and
     backbone[0].body.res2.conv1.weight to res2.conv1.weight.
     """
-    current_keys = sorted(list(model_state_dict.keys()))
-    loaded_keys = sorted(list(loaded_state_dict.keys()))
+    current_keys = sorted([k for k in model_state_dict.keys() if 'backbone' in k])
+    loaded_keys = sorted([k for k in loaded_state_dict.keys() if 'backbone' in k])
+    # current_keys = sorted(list(model_state_dict.keys()))
+    # loaded_keys = sorted(list(loaded_state_dict.keys()))
     # get a matrix of string matches, where each (i, j) entry correspond to the size of the
     # loaded_key string, if it matches
     match_matrix = [
@@ -33,7 +35,6 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, no_head):
     max_match_size, idxs = match_matrix.max(1)
     # remove indices that correspond to no-match
     idxs[max_match_size == 0] = -1
-
     # used for logging
     max_size = max([len(key) for key in current_keys]) if current_keys else 1
     max_size_loaded = max([len(key) for key in loaded_keys]) if loaded_keys else 1

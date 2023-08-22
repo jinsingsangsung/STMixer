@@ -12,7 +12,7 @@ from fvcore.nn import sigmoid_focal_loss_jit
 
 from . import box_ops
 from .misc import (accuracy, get_world_size,is_dist_avail_and_initialized)
-from .box_ops import generalized_box_iou
+from .box_ops import generalized_box_iou, box_cxcywh_to_xyxy
 
 from scipy.optimize import linear_sum_assignment
 
@@ -104,14 +104,15 @@ class SetCriterion(nn.Module):
         target_boxes = torch.cat([t['boxes_xyxy'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
         losses = {}
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(src_boxes, target_boxes))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
 
         image_size = torch.cat([v["image_size_xyxy_tgt"] for v in targets])
-        src_boxes_ = src_boxes / image_size
+        # src_boxes_ = src_boxes / image_size
         target_boxes_ = target_boxes / image_size
 
-        loss_bbox = F.l1_loss(src_boxes_, target_boxes_, reduction='none')
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), (box_cxcywh_to_xyxy(target_boxes_))))
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes_, reduction='none')
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
         return losses
@@ -261,13 +262,14 @@ class HungarianMatcher(nn.Module):
         image_size_out = image_size_out.unsqueeze(1).repeat(1, num_queries, 1).flatten(0, 1)
         image_size_tgt = torch.cat([v["image_size_xyxy_tgt"] for v in targets])
 
-        out_bbox_ = out_bbox / image_size_out
+        # out_bbox_ = out_bbox / image_size_out
         tgt_bbox_ = tgt_bbox / image_size_tgt
-        cost_bbox = torch.cdist(out_bbox_, tgt_bbox_, p=1)
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox_, p=1)
+        # cost_bbox = torch.cdist(out_bbox_, tgt_bbox_, p=1)
 
-        # Compute the giou cost betwen boxes
-        # cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-        cost_giou = -generalized_box_iou(out_bbox, tgt_bbox)
+        # Compute the giou cost between boxes
+        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox_))
+        # cost_giou = -generalized_box_iou(out_bbox, tgt_bbox)
 
         # Final cost matrix
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
