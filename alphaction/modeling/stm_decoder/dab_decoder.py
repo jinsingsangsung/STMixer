@@ -147,7 +147,7 @@ class TransformerDecoder(nn.Module):
 
         self.conv1 = nn.Conv2d(2*d_model, d_model, kernel_size=1)
         self.conv2 = nn.Conv2d(d_model, d_model, kernel_size=1)
-        self.q_proj = nn.Conv2d(d_model, d_model, kernel_size=1)
+        # self.q_proj = nn.Conv2d(d_model, d_model, kernel_size=1)
         self.k_proj = nn.Conv2d(d_model, d_model, kernel_size=1)
         self.v_proj = nn.Conv2d(d_model, d_model, kernel_size=1)
         
@@ -257,9 +257,9 @@ class TransformerDecoder(nn.Module):
             cls_feature = self.conv_activation(self.conv1(torch.cat([actor_feature_expanded, encoded_feature_expanded], dim=1)))
             cls_feature = self.conv_activation(self.conv2(cls_feature))
             # cls_feature = self.bn1(cls_feature)
-            query = self.q_proj(cls_feature)
-            query = query[:, None].expand(-1, 80, -1, -1, -1)
-            key = class_queries[None, :, :, None, None].expand(actor_feature_expanded.shape[0], -1, -1, h, w)
+            key = self.k_proj(cls_feature)
+            key = key[:, None].expand(-1, 80, -1, -1, -1)
+            query = class_queries[None, :, :, None, None].expand(actor_feature_expanded.shape[0], -1, -1, h, w)
             # key = self.cls_params[None, :, :, None, None].expand(actor_feature_expanded.shape[0], -1, -1, h, w)
             attn = (query*key).sum(dim=2).flatten(2).softmax(dim=2).reshape(actor_feature_expanded.shape[0], -1, h, w)[:, :, None]
             value = self.v_proj(encoded_feature_expanded)[:, None]
@@ -613,242 +613,6 @@ class AMStage(nn.Module):
                spatial_queries.view(N, n_query, -1), temporal_queries.view(N, n_query, -1)
 
 
-class DETR(nn.Module):
-    """ This is the DETR module that performs object detection """
-    def __init__(self, transformer, num_classes, num_queries, num_frames,
-                 hidden_dim, temporal_length, aux_loss=False, generate_lfb=False, two_stage=False, random_refpoints_xy=False, query_dim=4,
-                 backbone_name='CSN-152', ds_rate=1, last_stride=True, dataset_mode='ava', bbox_embed_diff_each_layer=True, training=True, iter_update=True,
-                 gpu_world_rank=0, log_path=None, efficient=True):
-        """ Initializes the model.
-        Parameters:
-            backbone: torch module of the backbone to be used. See backbone.py
-            transformer: torch module of the transformer architecture. See transformer.py
-            num_classes: number of object classes
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
-                         DETR can detect in a single image. For COCO, we recommend 100 queries.
-            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
-            random_refpoints_xy: random init the x,y of anchor boxes and freeze them. (It sometimes helps to improve the performance)
-        """            
-        super(DETR, self).__init__()
-        self.temporal_length = temporal_length
-        self.num_queries = num_queries
-        self.num_frames = num_frames
-        self.transformer = transformer
-        self.dataset_mode = dataset_mode
-        self.num_classes = num_classes
-        self.bbox_embed_diff_each_layer = bbox_embed_diff_each_layer
-        
-        self.query_dim = query_dim
-        assert query_dim in [2, 4]
-        self.efficient = efficient
-        if not efficient:
-            self.refpoint_embed = nn.Embedding(num_queries*temporal_length, 4)
-        else:
-            assert dataset_mode == "ava", "efficient mode is only for AVA"
-            self.refpoint_embed = nn.Embedding(num_queries, 4)
-        self.transformer.eff = efficient
-        self.random_refpoints_xy = random_refpoints_xy
-        if random_refpoints_xy:
-            # import ipdb; ipdb.set_trace()
-            self.refpoint_embed.weight.data[:, :2].uniform_(0,1)
-            self.refpoint_embed.weight.data[:, :2] = inverse_sigmoid(self.refpoint_embed.weight.data[:, :2])
-            self.refpoint_embed.weight.data[:, :2].requires_grad = False          
-
-        if "SWIN" in backbone_name:
-            if gpu_world_rank == 0: print_log(log_path, "using swin")
-            self.input_proj = nn.Conv3d(1024, hidden_dim, kernel_size=1)
-            self.class_proj = nn.Conv3d(1024, hidden_dim, kernel_size=1)
-        elif "SlowFast" in backbone_name:
-            self.input_proj = nn.Conv3d(backbone.num_channels, hidden_dim, kernel_size=1)
-            self.class_proj = nn.Conv3d(2048 + 512, hidden_dim, kernel_size=1)
-        else:
-            self.input_proj = nn.Conv3d(backbone.num_channels, hidden_dim, kernel_size=1)
-            self.class_proj = nn.Conv3d(backbone.num_channels, hidden_dim, kernel_size=1)
-        nn.init.xavier_uniform_(self.input_proj.weight, gain=1)
-        nn.init.constant_(self.input_proj.bias, 0)    
-        # self.class_proj = nn.Conv3d(backbone.num_channels[-1], hidden_dim, kernel_size=(4,1,1))
-
-        # encoder_layer = TransformerEncoderLayer(hidden_dim, 8, 2048, 0.1, "relu", normalize_before=False)
-        # self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=2)
-        # decoder_layer = TransformerDecoderLayer(hidden_dim, 8, 2048, 0.1, "relu", normalize_before=False)        
-        # decoder_norm = nn.LayerNorm(hidden_dim)
-        # self.decoder = TransformerDecoder(decoder_layer=decoder_layer, num_layers=3, norm=decoder_norm, return_intermediate=True, query_dim=4, modulate_hw_attn=True, bbox_embed_diff_each_layer=True)
-        # self.num_patterns = 3
-        # self.num_pattern_message:%3CTQB5fQ7CQ_2uZmev7pIQjA@geopod-ismtpd-5%3Elevel = 4
-        # self.patterns = nn.Embedding(self.num_patterns*self.num_pattern_level, hidden_dim)
-        prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        if self.dataset_mode == 'ava':
-            # self.class_embed = nn.Linear(hidden_dim, num_classes)
-            self.class_embed = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 1)
-            )
-            self.class_embed_b = nn.Linear(hidden_dim, 3)
-            # self.class_embed.bias.data = torch.ones(num_classes) * bias_value
-        else:
-            self.class_embed = nn.Linear(2*hidden_dim, num_classes+1)
-            self.class_embed_b = nn.Linear(hidden_dim, 3)
-            self.class_embed.bias.data = torch.ones(num_classes+1) * bias_value
-        
-
-        if bbox_embed_diff_each_layer:
-            self.bbox_embed = nn.ModuleList([MLP(hidden_dim, hidden_dim, 4, 3) for i in range(transformer.num_dec_layers)])
-            for bbox_embed in self.bbox_embed:
-                nn.init.constant_(bbox_embed.layers[-1].weight.data, 0)
-                nn.init.constant_(bbox_embed.layers[-1].bias.data, 0)
-        else:
-            self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-            nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-            nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
-
-
-        self.iter_update = iter_update
-        if self.iter_update:
-            self.transformer.decoder.bbox_embed = self.bbox_embed
-
-
-        self.dropout = nn.Dropout(0.5)
-
-        self.backbone = backbone
-        self.aux_loss = aux_loss
-
-        self.two_stage = two_stage
-        self.hidden_dim = hidden_dim
-        self.is_swin = "SWIN" in backbone_name
-        self.generate_lfb = generate_lfb
-        self.last_stride = last_stride
-        self.training = training
-
-
-    def freeze_params(self):
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-        for param in self.transformer.parameters():
-            param.requires_grad = False
-        for param in self.bbox_embed.parameters():
-            param.requires_grad = False
-        for param in self.input_proj.parameters():
-            param.requires_grad = False
-        for param in self.class_embed_b.parameters():
-            param.requires_grad = False
-
-    def forward(self, features, targets=None):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
-
-            It returns a dict with the following elements:
-               - "pred_logits": the classification logits (including no-object) for all queries.
-                                Shape= [batch_size x num_queries x (num_classes + 1)]
-               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
-                               (center_x, center_y, height, width). These values are normalized in [0, 1],
-                               relative to the size of each individual image (disregarding possible padding).
-                               See PostProcess for information on how to retrieve the unnormalized bounding box.
-               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
-                                dictionnaries containing the two above keys for each decoder layer.
-        """
-        features = make_interpolated_features(features)
-
-        if not isinstance(features, NestedTensor):
-            features = nested_tensor_from_tensor_list(features)
-        
-        srcs = []
-        masks = []
-        for l, feat in enumerate(features):
-            src, mask = feat.decompose()
-            srcs.append(self.input_proj[l](src))
-            masks.append(mask)
-            assert mask is not None
-        # import ipdb; ipdb.set_trace()
-
-        if self.num_feature_levels > len(srcs):
-            _len_srcs = len(srcs)
-            for l in range(_len_srcs, self.num_feature_levels):
-                if l == _len_srcs:
-                    src = self.input_proj[l](features[-1].tensors)
-                else:
-                    src = self.input_proj[l](srcs[-1])
-                m = samples.mask
-                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
-                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
-                srcs.append(src)
-                masks.append(mask)
-                pos.append(pos_l)        
-        
-        if not isinstance(samples, NestedTensor):
-            samples = nested_tensor_from_tensor_list(samples)
-        interpolated_features = make_interpolated_features(features)
-        src, mask = features[-1].decompose()
-        assert mask is not None
-        # bs = samples.tensors.shape[0]
-        if not self.efficient:
-            embedweight = self.refpoint_embed.weight.view(self.num_queries, self.temporal_length, 4)      # nq, t, 4
-        else:
-            embedweight = self.refpoint_embed.weight.view(self.num_queries, 1, 4)  
-        hs, cls_hs, reference  = self.transformer(self.input_proj(src), mask, embedweight, pos[-1])
-        outputs_class_b = self.class_embed_b(hs)
-        ######## localization head
-        if not self.bbox_embed_diff_each_layer:
-            reference_before_sigmoid = inverse_sigmoid(reference)
-            tmp = self.bbox_embed(hs)
-            tmp[..., :self.query_dim] += reference_before_sigmoid
-            outputs_coord = tmp.sigmoid()
-        else:
-            reference_before_sigmoid = inverse_sigmoid(reference)
-            outputs_coords = []
-            for lvl in range(hs.shape[0]):
-                # hs.shape: lay_n, bs, nq, dim
-                tmp = self.bbox_embed[lvl](hs[lvl])
-                tmp[..., :self.query_dim] += reference_before_sigmoid[lvl]
-                outputs_coord = tmp.sigmoid()
-                outputs_coords.append(outputs_coord)
-            outputs_coord = torch.stack(outputs_coords)        
-
-        ######## mix temporal features for classification
-        # lay_n, bst, nq, dim = hs.shape
-        # hw, bst, ch = memory.shape
-        bs, _, t, h, w = src.shape
-        # memory = self.encoder(memory, src.shape, mask, pos_embed)
-        ##### prepare for the second decoder
-        # tgt = self.patterns.weight[:, None, None, :].repeat(1, self.num_queries, bs*t, 1).flatten(0, 1) # n_q*n_pat, bs, d_model
-        # embedweight = embedweight.repeat(self.num_patterns, bs, 1) # n_pat*n_q, bst, 4
-        # hs_c, ref_c = self.decoder(tgt, memory, memory_key_padding_mask=mask, pos=pos_embed, refpoints_unsigmoid=embedweight)
-        lay_n = self.transformer.decoder.num_layers
-        # outputs_class = self.class_embed(self.dropout(hs)).reshape(lay_n, bs*t, self.num_patterns, self.num_queries, -1).max(dim = 2)[0]
-        if not self.efficient:
-            outputs_class = self.class_embed(self.dropout(cls_hs)).reshape(lay_n, bs*t, self.num_queries, -1)
-        else:
-            outputs_class = self.class_embed(self.dropout(cls_hs)).reshape(lay_n, bs, self.num_queries, -1)
-        if self.dataset_mode == "ava":
-            if not self.efficient:
-                outputs_class = outputs_class.reshape(-1, bs, t, self.num_queries, self.num_classes)[:,:,self.temporal_length//2,:,:]
-                outputs_coord = outputs_coord.reshape(-1, bs, t, self.num_queries, 4)[:,:,self.temporal_length//2,:,:]
-                outputs_class_b = outputs_class_b.reshape(-1, bs, t, self.num_queries, 3)[:,:,self.temporal_length//2,:,:]
-            else:
-                outputs_class = outputs_class.reshape(-1, bs, self.num_queries, self.num_classes)
-                outputs_coord = outputs_coord.reshape(-1, bs, self.num_queries, 4)
-                outputs_class_b = outputs_class_b.reshape(-1, bs, self.num_queries, 3)
-        else:
-            outputs_class = outputs_class.reshape(-1, bs, t, self.num_queries, self.num_classes+1)
-            outputs_coord = outputs_coord.reshape(-1, bs, t, self.num_queries, 4)
-            outputs_class_b = outputs_class_b.reshape(-1, bs, t, self.num_queries, 3)
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_logits_b': outputs_class_b[-1],}
-        if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_class_b)
-
-        return out
-    @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_class_b):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
-
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_logits_b': c}
-                for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_class_b[:-1])]
-
-
 class EncoderStage(nn.Module):
     def __init__(self,
                  feat_channels=256,
@@ -857,7 +621,8 @@ class EncoderStage(nn.Module):
                  num_levels=4,
                  feedforward_channels=2048,
                  dropout=0.1,
-                 ffn_act='RelU',):
+                 ffn_act='RelU',
+                 last=True):
 
         super(EncoderStage, self).__init__()
         self.hidden_dim = feat_channels
@@ -883,9 +648,10 @@ class EncoderStage(nn.Module):
             nn.Linear(feat_channels, num_levels),
             nn.Softmax(dim=-1),
         )
-        self.next_embed = nn.Sequential(
-            nn.Linear(feat_channels, 3),
-        )
+        if not last:
+            self.next_embed = nn.Sequential(
+                nn.Linear(feat_channels, 3),
+            )
         self.norm = nn.LayerNorm(feat_channels)
 
     def offset_adder(self, x, offset, indices):
@@ -901,14 +667,13 @@ class EncoderStage(nn.Module):
         h_indices = indices // W % H / (H-1) # B, L, N
         t_indices = indices // W // H / (T-1) # B, L, N
         thw_indices = torch.stack([t_indices, h_indices, w_indices], dim=-1) # B, L, N, 3
-        displaced_indices = (inverse_sigmoid(thw_indices) + offset).sigmoid() # B, L, N, 3
+        displaced_indices = (inverse_sigmoid(thw_indices) + offset*10).sigmoid() # B, L, N, 3
         w_ = torch.full((B,L,N,1), W-1, device=displaced_indices.device)
         h_ = torch.full((B,L,N,1), H-1, device=displaced_indices.device)
         t_ = torch.full((B,L,N,1), T-1, device=displaced_indices.device)
         displaced_indices = (displaced_indices*torch.cat([t_, h_, w_], dim=-1)).round().long() # B, L, N, 3
         flat_indices = (H*W*displaced_indices[...,0] + W*displaced_indices[...,1] + displaced_indices[...,2]) # B, L, N
         return flat_indices
-        
         
     def build_flow_field(self, x, offset, indices):
         """
@@ -983,7 +748,7 @@ class EncoderStage(nn.Module):
         return sampled_pts, flat_indices
         
     
-    def forward(self, features, pos, ind=None):
+    def forward(self, features, pos, ind=None, is_last=False):
         B, C, T, H, W, L = features.shape
         THW = T*H*W
         N_o = self.num_offsets
@@ -996,7 +761,8 @@ class EncoderStage(nn.Module):
         glob_context_ = repeat(glob_context, 'B C L -> B L N C', N=N)
         offset_src = torch.cat([sampled_pts, sampled_pos, glob_context_], dim=-1)
         offset_src = self.proj_layers(offset_src) # B L N 3C -> B L N C
-        next = self.next_embed(offset_src) # B L N 3
+        if not is_last:
+            next = self.next_embed(offset_src) # B L N 3
         weight_l = self.weight_l_embed(offset_src) # B L N L
         
         offset_src = rearrange(offset_src, 'B L N (N_o d) -> (B L N_o) N d', N_o=N_o, d=C//N_o)
@@ -1039,8 +805,11 @@ class EncoderStage(nn.Module):
         features = (features[..., None]*weight_l).sum(dim=-1) # B C T H W L
 
         features = self.norm(features.transpose(1,-1).contiguous()).transpose(1,-1).contiguous()
-
-        next_ind = self.offset_adder(features, next, ind_pts)
+        
+        if not is_last:
+            next_ind = self.offset_adder(features, next, ind_pts)
+        else:
+            next_ind = None
         return features, next_ind
 
 
@@ -1071,19 +840,9 @@ class STMDecoder(nn.Module):
                 feedforward_channels=cfg.MODEL.STM.DIM_FEEDFORWARD,
                 dropout=cfg.MODEL.STM.DROPOUT,
                 ffn_act=cfg.MODEL.STM.ACTIVATION,
+                last=(i==self.num_enc_stages-1),
             )
             self.encoder_stages.append(encoder_stage)
-        # for i in range(self.num_stages):
-        #     decoder_stage = DecoderStage(
-        #         d_model=cfg.MODEL.STM.HIDDEN_DIM,
-        #         num_heads=cfg.MODEL.STM.NUM_HEADS,
-        #         dim_feedforward=cfg.MODEL.STM.DIM_FEEDFORWARD,
-        #         dropout=cfg.MODEL.STM.DROPOUT,
-        #         activation=cfg.MODEL.STM.ACTIVATION,
-        #         normalize_before=False,
-        #         keep_query_pos=False,
-        #         )
-        #     self.decoder_stages.append(decoder_stage)
         
         decoder_layer = DecoderStage(
                 d_model=cfg.MODEL.STM.HIDDEN_DIM,
@@ -1215,10 +974,9 @@ class STMDecoder(nn.Module):
         pos = torch.stack(pos, dim=-1) # B, C, T, H, W, L
 
         ind = None
-
         for l, encoder_stage in enumerate(self.encoder_stages):
-            srcs, ind = encoder_stage(srcs, pos, ind)
-            print("stage ", l, " passed")
+            srcs, ind = encoder_stage(srcs, pos, ind, l==len(self.encoder_stages)-1)
+            # import pdb; pdb.set_trace()
 
         spatial_queries, class_queries = self._decode_init_queries(whwh)
         # B, N_q, query_dim // N_c, D
@@ -1280,10 +1038,10 @@ class STMDecoder(nn.Module):
 
                 action_score = action_scores[i][selected_idx]
                 box = outputs_coord[-1][i][selected_idx]
-                cur_whwh = whwh[i]
-                box = clip_boxes_tensor(box, cur_whwh[1], cur_whwh[0])
-                box[:, 0::2] /= cur_whwh[0]
-                box[:, 1::2] /= cur_whwh[1]
+                # cur_whwh = whwh[i]
+                # box = clip_boxes_tensor(box, cur_whwh[1], cur_whwh[0])
+                # box[:, 0::2] /= cur_whwh[0]
+                # box[:, 1::2] /= cur_whwh[1]
                 action_score_list.append(action_score)
                 box_list.append(box)
             return action_score_list, box_list

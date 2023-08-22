@@ -43,6 +43,7 @@ def train(cfg, local_rank, distributed, tblogger=None, transfer_weight=False, ad
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=True,
         )
 
     arguments = {}
