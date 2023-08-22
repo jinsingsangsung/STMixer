@@ -10,6 +10,11 @@ from alphaction.utils.comm import synchronize, reduce_dict, all_gather
 from alphaction.structures.memory_pool import MemoryPool
 import torch.nn as nn
 
+import json
+import requests
+import traceback
+import os
+
 def do_train(
         model,
         data_loader,
@@ -49,37 +54,37 @@ def do_train(
         iteration = iteration + 1
         arguments["iteration"] = iteration
 
-        slow_video = slow_video.to(device)
-        if fast_video is not None:
-            fast_video = fast_video.to(device)
-        whwh = whwh.to(device)
-        mem_extras = {}
-        if mem_active:
-            movie_ids = [m[0] for m in metadata]
-            timestamps = [m[1] for m in metadata]
-            mem_extras["person_pool"] = person_pool
-            mem_extras["movie_ids"] = movie_ids
-            mem_extras["timestamps"] = timestamps
-            mem_extras["cur_loss"] = losses_reduced.item()
+        # slow_video = slow_video.to(device)
+        # if fast_video is not None:
+        #     fast_video = fast_video.to(device)
+        # whwh = whwh.to(device)
+        # mem_extras = {}
+        # if mem_active:
+        #     movie_ids = [m[0] for m in metadata]
+        #     timestamps = [m[1] for m in metadata]
+        #     mem_extras["person_pool"] = person_pool
+        #     mem_extras["movie_ids"] = movie_ids
+        #     mem_extras["timestamps"] = timestamps
+        #     mem_extras["cur_loss"] = losses_reduced.item()
 
 
-        loss_dict  = model(slow_video, fast_video, whwh, boxes, labels)
-        losses = sum(loss_dict.values()) / len(loss_dict)
+        # loss_dict  = model(slow_video, fast_video, whwh, boxes, labels)
+        # losses = sum(loss_dict.values()) / len(loss_dict)
 
-        # reduce losses over all GPUs for logging purposes
-        loss_dict["total_loss"] = losses.detach().clone()
-        loss_dict_reduced = reduce_dict(loss_dict)
+        # # reduce losses over all GPUs for logging purposes
+        # loss_dict["total_loss"] = losses.detach().clone()
+        # loss_dict_reduced = reduce_dict(loss_dict)
 
-        meters.update(**loss_dict_reduced)
-        losses_reduced = loss_dict_reduced.pop("total_loss")
+        # meters.update(**loss_dict_reduced)
+        # losses_reduced = loss_dict_reduced.pop("total_loss")
 
-        optimizer.zero_grad()
-        losses.backward()
+        # optimizer.zero_grad()
+        # losses.backward()
         optimizer.step()
 
-        # update mem pool
-        if mem_active:
-            pass
+        # # update mem pool
+        # if mem_active:
+        #     pass
 
         batch_time = time.time() - end
         end = time.time()
@@ -88,7 +93,7 @@ def do_train(
         eta_seconds = meters.time.global_avg * (max_iter - iteration)
         eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
-        if iteration % 1000 == 0 or iteration == max_iter:
+        if iteration % 100 == 0 or iteration == max_iter:
             logger.info(
                 meters.delimiter.join(
                     [
@@ -120,7 +125,8 @@ def do_train(
             arguments.pop("person_pool", None)
             checkpointer.save("model_final", **arguments)
 
-        if dataset_names_val and iteration > start_val and iteration % val_period == 0:
+        # if dataset_names_val and iteration > start_val and iteration % val_period == 0:
+        if iteration % 100 == 0:
             optimizer.zero_grad()
             torch.cuda.empty_cache()
             # do validation
@@ -177,3 +183,14 @@ def val_in_train(
             eval_res, _ = eval_res
             total_mAP = eval_res['PascalBoxes_Precision/mAP@0.5IOU']
             tblogger.add_scalar(dataset_name + '_mAP_0.5IOU', total_mAP, iteration)
+        
+        try:
+            metrics_data = json.dumps({
+                    '@iteration': iteration,
+                    '@step': iteration, # actually epoch
+                    '@time': time.time(),
+                    'val_mAP': total_mAP
+                    })
+            requests.post(os.environ['NSML_METRIC_API'], data=metrics_data)
+        except:
+            traceback.print_exc()
