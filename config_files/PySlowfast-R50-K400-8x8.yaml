@@ -73,4 +73,4 @@ SOLVER:
   OPTIMIZING_METHOD: 'adamw'
 TEST:
   VIDEOS_PER_BATCH: 16
-OUTPUT_DIR: "/mnt/video-nfs5/users/jinsung/results/STmixer/"
+OUTPUT_DIR: "/mnt/video_nfs4/users/jinsung/results/STmixer/"
